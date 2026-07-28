@@ -1694,7 +1694,20 @@ fn enforce_control_plane_freeze(
             .repo_root
             .join("crates/harness-cli/Cargo.toml")
             .is_file();
-    let targets_default_database = context.db_path == context.repo_root.join("harness.db");
+    let default_db = context.repo_root.join("harness.db");
+    // Resolve relative paths against the repo root so the freeze sentinel
+    // cannot be bypassed by supplying `harness.db`, `./harness.db`, or any
+    // other string that refers to the same target database. Best-effort
+    // canonicalize closes the symlink bypass when the file already exists.
+    let resolved_db_path = if context.db_path.is_relative() {
+        context.repo_root.join(&context.db_path)
+    } else {
+        context.db_path.clone()
+    };
+    let canonical_resolved =
+        std::fs::canonicalize(&resolved_db_path).unwrap_or(resolved_db_path.clone());
+    let canonical_default = std::fs::canonicalize(&default_db).unwrap_or(default_db);
+    let targets_default_database = canonical_resolved == canonical_default;
     if !is_upstream_source || !targets_default_database {
         return Ok(None);
     }
@@ -2436,10 +2449,24 @@ fn print_interventions(records: &[InterventionRecord]) {
 }
 
 fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn print_stats(stats: &HarnessStats) {

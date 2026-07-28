@@ -171,7 +171,7 @@ The result is an array ordered by `id`. Each record has:
 {
   "id": "US-092",
   "title": "Machine-Readable Harness Orchestration Contract",
-  "risk_lane": "high-risk",
+  "risk_lane": "high_risk",
   "contract_doc": "docs/.../overview.md",
   "status": "planned",
   "verify_command": "cargo test --locked",
