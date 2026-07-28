@@ -613,7 +613,11 @@ read_cli_release_tag() {
   else
     local tmp_file
     tmp_file="$(mktemp)"
-    if curl -fsSL "$SOURCE_BASE_URL/$tag_file" -o "$tmp_file" 2>/dev/null; then
+    if ! curl -fsSL "$SOURCE_BASE_URL/$tag_file" -o "$tmp_file" 2>/dev/null; then
+      echo "warning: could not fetch pinned CLI release tag from $SOURCE_BASE_URL/$tag_file; falling back to latest published release." >&2
+    elif [ ! -s "$tmp_file" ]; then
+      echo "warning: pinned CLI release tag at $SOURCE_BASE_URL/$tag_file was empty; falling back to latest published release." >&2
+    else
       tag="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' "$tmp_file")"
     fi
     rm -f "$tmp_file"

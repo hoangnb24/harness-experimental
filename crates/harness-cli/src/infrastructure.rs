@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use fs2::FileExt;
 use rusqlite::{
     config::DbConfig,
     hooks::{AuthAction, AuthContext, Authorization},
@@ -262,6 +263,11 @@ pub struct SqliteHarnessRepository {
 struct ChangesetAppend {
     path: PathBuf,
     original_len: u64,
+    /// Held exclusively while the append is in flight and during rollback so a
+    /// concurrent CLI invocation cannot `set_len` our pending bytes (which
+    /// previously caused it to clobber a sibling process's committed
+    /// operations).
+    file: Option<std::fs::File>,
 }
 
 #[derive(Debug)]
@@ -753,14 +759,22 @@ impl SqliteHarnessRepository {
 
     fn apply_pending_migrations(
         &self,
-        connection: &Connection,
+        connection: &mut Connection,
         current_version: i64,
     ) -> Result<Vec<i64>> {
         let mut applied = Vec::new();
         for (version, path) in self.migration_files()? {
             if version > current_version {
                 let sql = fs::read_to_string(path)?;
-                connection.execute_batch(&sql)?;
+                // Wrap each migration in a single transaction so a crash
+                // mid-script cannot leave the schema half-applied (e.g.
+                // `schema_version` recorded but tables not yet created).
+                // Without this, `apply_schema_v1` could record `version = 1`
+                // before the CREATE TABLE statements run and brick the DB.
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(&sql)?;
+                transaction.commit()?;
                 applied.push(version);
             }
         }
@@ -795,6 +809,31 @@ impl SqliteHarnessRepository {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .and_then(|value| {
+                if Self::is_safe_run_id(&value) {
+                    Some(value)
+                } else {
+                    // Reject absolute paths, traversal segments, and any character
+                    // outside the safe set so HARNESS_RUN_ID cannot escape
+                    // `.harness/changesets` when joined into a path.
+                    None
+                }
+            })
+    }
+
+    /// Validates that a run id can safely be joined under `.harness/changesets`
+    /// without escaping it. Allows the character set used by both automatic
+    /// run ids (`run_auto_*`) and explicit ids supplied via the programmatic
+    /// test helper. Rejects absolute paths, `..` segments, separators, NULs,
+    /// and any other character outside `[A-Za-z0-9._-]`.
+    fn is_safe_run_id(run_id: &str) -> bool {
+        !run_id.is_empty()
+            && run_id.len() <= 128
+            && !run_id.starts_with('.')
+            && run_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+            && !run_id.contains("..")
     }
 
     fn is_source_tracked_state(repo_root: &Path, db_path: &Path) -> bool {
@@ -874,6 +913,11 @@ impl SqliteHarnessRepository {
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Hold an exclusive advisory lock for the entire append+commit
+        // window so a concurrent CLI invocation cannot `set_len` the file
+        // (its own rollback path) and clobber bytes that another process
+        // has already committed.
+        file.lock_exclusive()?;
 
         if original_len == 0 {
             let header = json!({
@@ -890,8 +934,13 @@ impl SqliteHarnessRepository {
         }
         file.flush()?;
         file.sync_all()?;
-
-        Ok(Some(ChangesetAppend { path, original_len }))
+        // Keep the lock held; release only on success (ChangesetAppend is
+        // dropped) or explicit rollback (which reuses the same descriptor).
+        Ok(Some(ChangesetAppend {
+            path,
+            original_len,
+            file: Some(file),
+        }))
     }
 
     fn parse_changeset(&self, path: &Path) -> Result<ParsedChangeset> {
@@ -1170,8 +1219,9 @@ impl HarnessRepository for SqliteHarnessRepository {
             let connection = self.open_existing()?;
             let current = Self::schema_version(&connection).unwrap_or(0);
             if current == 0 {
+                let mut connection = connection;
                 self.apply_schema_v1(&connection)?;
-                self.apply_pending_migrations(&connection, 1)?;
+                self.apply_pending_migrations(&mut connection, 1)?;
                 return Ok(InitResult::MigratedExisting {
                     db_path: self.db_path.clone(),
                 });
@@ -1183,18 +1233,18 @@ impl HarnessRepository for SqliteHarnessRepository {
             });
         }
 
-        let connection = self.open_or_create()?;
+        let mut connection = self.open_or_create()?;
         self.apply_schema_v1(&connection)?;
-        self.apply_pending_migrations(&connection, 1)?;
+        self.apply_pending_migrations(&mut connection, 1)?;
         Ok(InitResult::Created {
             db_path: self.db_path.clone(),
         })
     }
 
     fn migrate(&self) -> Result<MigrateResult> {
-        let connection = self.open_existing()?;
+        let mut connection = self.open_existing()?;
         let current_version = Self::schema_version(&connection).unwrap_or(0);
-        let applied = self.apply_pending_migrations(&connection, current_version)?;
+        let applied = self.apply_pending_migrations(&mut connection, current_version)?;
 
         Ok(MigrateResult {
             current_version,
@@ -5231,10 +5281,21 @@ fn logical_database_sha256(connection: &Connection) -> Result<String> {
 }
 
 fn rollback_changeset_append(append: &ChangesetAppend) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).open(&append.path)?;
-    file.set_len(append.original_len)?;
-    file.seek(SeekFrom::Start(append.original_len))?;
-    file.sync_all()?;
+    // Prefer reusing the descriptor from the original append: it still holds
+    // the exclusive lock, so `set_len` cannot race with another process
+    // concurrently writing to the same changeset file.
+    if let Some(existing) = append.file.as_ref() {
+        let mut file = existing;
+        file.set_len(append.original_len)?;
+        file.seek(SeekFrom::Start(append.original_len))?;
+        file.sync_all()?;
+    } else {
+        let mut file = OpenOptions::new().write(true).open(&append.path)?;
+        file.lock_exclusive()?;
+        file.set_len(append.original_len)?;
+        file.seek(SeekFrom::Start(append.original_len))?;
+        file.sync_all()?;
+    }
     Ok(())
 }
 

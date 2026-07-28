@@ -6,6 +6,15 @@ on:
     branches:
       - main
 
+# Two PR merges that close in quick succession previously raced here: each
+# would read the latest CHANGELOG.md / release-tag state, append its own
+# patch bump, and push — leaving one of the two releases silently lost.
+# Serialize them through a single concurrency group that cancels the older
+# in-flight run so the newer merged PR's state-of-the-world wins.
+concurrency:
+  group: post-merge-maintenance-main
+  cancel-in-progress: true
+
 permissions:
   contents: write
   pull-requests: read

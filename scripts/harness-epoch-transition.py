@@ -206,17 +206,27 @@ def compensate(payload: dict[str, Any], journal: Path) -> None:
     reconcile_unjournaled_renames(payload, journal)
     item = paths(payload)
     completed = set(payload["completed_steps"])
-    # Move activated fresh paths back first, then restore the legacy pair.
-    if "fresh_log_activated" in completed:
-        os.replace(item["active_log"], item["fresh_log"])
-    if "fresh_db_activated" in completed:
-        os.replace(item["active_db"], item["fresh_db"])
-    if "legacy_log_archived" in completed:
-        os.replace(item["legacy_log"], item["active_log"])
-    if "legacy_db_archived" in completed:
-        os.replace(item["legacy_db"], item["active_db"])
-    for parent in {path.parent for path in item.values()}:
-        fsync_dir(parent)
+    # Compensation reverses the forward order: move fresh paths back into
+    # place, then restore the legacy pair. Each step must be checkpointed
+    # in the journal before the next one runs so a crash mid-compensation
+    # leaves the system resumable instead of half-recovered. The previous
+    # implementation did all four `os.replace` calls in a row, so a single
+    # mid-flight crash left the tool unable to recover itself.
+    compensations = (
+        ("fresh_log_activated", item["active_log"], item["fresh_log"]),
+        ("fresh_db_activated", item["active_db"], item["fresh_db"]),
+        ("legacy_log_archived", item["legacy_log"], item["active_log"]),
+        ("legacy_db_archived", item["legacy_db"], item["active_db"]),
+    )
+    for step, source, destination in compensations:
+        if step not in completed:
+            continue
+        if destination.exists():
+            raise TransitionError(f"compensation destination already exists: {destination}")
+        os.replace(source, destination)
+        fsync_dir(destination.parent)
+        payload["state"] = f"compensating:{step}"
+        write_journal(journal, payload)
     verify_pair(payload, "legacy")
     payload["state"] = "compensated"
     payload["completed_steps"] = []
