@@ -1256,6 +1256,14 @@ pub fn run(cli: Cli) -> Result<(), InterfaceError> {
             }
             StoryAction::Complete { id, json } => {
                 let result = service.complete_story(&id)?;
+                if result.result == "fail" {
+                    return Err(InterfaceError::Infrastructure(
+                        crate::infrastructure::HarnessInfraError::StoryCompletion(format!(
+                            "verification command failed for story {id}: {}",
+                            result.command
+                        )),
+                    ));
+                }
                 if json {
                     return print_machine_success(
                         "story.complete",
