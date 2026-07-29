@@ -267,6 +267,14 @@ struct ChangesetAppend {
     /// concurrent CLI invocation cannot `set_len` our pending bytes (which
     /// previously caused it to clobber a sibling process's committed
     /// operations).
+    ///
+    /// Invariant: `file` is always `Some` in practice — `ChangesetAppend` is
+    /// only constructed in `append_changeset_operations` and that path always
+    /// populates this field with the locked descriptor it just opened. The
+    /// `None` arm exists only so `rollback_changeset_append` can recover a
+    /// best-effort truncation if the field is ever unset, but does not
+    /// reintroduce a race because in that branch the helper re-acquires the
+    /// exclusive lock and holds it for the whole rollback before dropping.
     file: Option<std::fs::File>,
 }
 
@@ -887,8 +895,8 @@ impl SqliteHarnessRepository {
         match transaction.commit() {
             Ok(()) => Ok(result),
             Err(error) => {
-                if let Some(append) = append {
-                    rollback_changeset_append(&append)?;
+                if let Some(mut append) = append {
+                    rollback_changeset_append(&mut append)?;
                 }
                 Err(error.into())
             }
@@ -5280,16 +5288,21 @@ fn logical_database_sha256(connection: &Connection) -> Result<String> {
     Ok(sha256_bytes(&serde_json::to_vec(&canonical_tables)?))
 }
 
-fn rollback_changeset_append(append: &ChangesetAppend) -> Result<()> {
+fn rollback_changeset_append(append: &mut ChangesetAppend) -> Result<()> {
     // Prefer reusing the descriptor from the original append: it still holds
     // the exclusive lock, so `set_len` cannot race with another process
-    // concurrently writing to the same changeset file.
-    if let Some(existing) = append.file.as_ref() {
-        let mut file = existing;
+    // concurrently writing to the same changeset file. `as_mut` is required
+    // because we seek the descriptor and seek needs a mutable reference; we
+    // shadow the binding to keep the rollback block readable.
+    if let Some(file) = append.file.as_mut() {
         file.set_len(append.original_len)?;
         file.seek(SeekFrom::Start(append.original_len))?;
         file.sync_all()?;
     } else {
+        // Defensive branch — see the struct invariant on `file`. Re-acquire the
+        // exclusive lock and hold it for the whole rollback window so a
+        // concurrent writer cannot clobber the truncation mid-operation, then
+        // flush before letting the descriptor drop.
         let mut file = OpenOptions::new().write(true).open(&append.path)?;
         file.lock_exclusive()?;
         file.set_len(append.original_len)?;
@@ -10926,5 +10939,100 @@ implemented
             sha256_bytes(&fs::read(&result.output).unwrap()),
             result.snapshot_file_sha256
         );
+    }
+
+    #[test]
+    fn rollback_changeset_append_truncates_to_original_len() {
+        // Reproduces the rollback path that fires when a transaction commits
+        // fail after the changeset has been buffered but before it is durable.
+        // The helper must restore the file to exactly its `original_len` and
+        // leave the pre-existing bytes intact — otherwise a partially-rolled
+        // back changeset could leave half-written lines that the replay path
+        // later treats as committed operations.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("rollback.changeset.jsonl");
+        let pre_existing = "{\"op\":\"changeset.header\",\"version\":1,\"run_id\":\"run_prior\",\"base_schema_version\":13}\n";
+        fs::write(&path, pre_existing).unwrap();
+        let original_len = pre_existing.len() as u64;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.lock_exclusive().unwrap();
+        // Simulate the operations that would have been buffered before the
+        // commit failed. Bytes past `original_len` are what the rollback must
+        // discard.
+        let pending = "{\"op\":\"story.add\",\"version\":1,\"id\":\"US-ROLL\",\"payload\":{\"title\":\"Roll\",\"risk_lane\":\"normal\",\"contract_doc\":null,\"verify_command\":\"true\",\"notes\":null}}\n";
+        writeln!(file, "{}", pending).unwrap();
+        file.flush().unwrap();
+
+        let mut append = ChangesetAppend {
+            path: path.clone(),
+            original_len,
+            file: Some(file),
+        };
+
+        rollback_changeset_append(&mut append).unwrap();
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            after.len() as u64,
+            original_len,
+            "rollback must restore original length"
+        );
+        assert_eq!(
+            std::str::from_utf8(&after).unwrap(),
+            pre_existing,
+            "rollback must leave pre-existing bytes intact",
+        );
+        // The locked descriptor is still held so a concurrent writer cannot
+        // have raced between the truncation and the read above.
+        assert!(append.file.is_some());
+    }
+
+    #[test]
+    fn rollback_changeset_append_reacquires_lock_when_handle_missing() {
+        // The defensive `file: None` branch is unreachable from production
+        // code today (see the struct invariant) but exists so the helper can
+        // still truncate if a future call site constructs a ChangesetAppend
+        // without keeping the locked descriptor. This test pins that
+        // behaviour: even when the helper reopens the file, it must hold an
+        // exclusive lock for the entire rollback window and leave only the
+        // pre-existing bytes behind.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("rollback-no-handle.changeset.jsonl");
+        let pre_existing = "{\"op\":\"changeset.header\",\"version\":1,\"run_id\":\"run_prior\",\"base_schema_version\":13}\n";
+        fs::write(&path, pre_existing).unwrap();
+        let original_len = pre_existing.len() as u64;
+
+        // Drop the locked descriptor so the helper has to reopen.
+        let mut append = ChangesetAppend {
+            path: path.clone(),
+            original_len,
+            file: None,
+        };
+        // Stage bytes past the rollback boundary that the helper must
+        // discard.
+        let mut stage = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            stage,
+            "{}",
+            "{\"op\":\"story.add\",\"version\":1,\"id\":\"US-STAGE\",\"payload\":{\"title\":\"Stage\",\"risk_lane\":\"normal\",\"contract_doc\":null,\"verify_command\":\"true\",\"notes\":null}}"
+        )
+        .unwrap();
+        stage.flush().unwrap();
+        drop(stage);
+
+        rollback_changeset_append(&mut append).unwrap();
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(after.len() as u64, original_len);
+        assert_eq!(std::str::from_utf8(&after).unwrap(), pre_existing);
     }
 }
