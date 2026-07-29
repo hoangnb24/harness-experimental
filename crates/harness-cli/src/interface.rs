@@ -1694,21 +1694,24 @@ fn enforce_control_plane_freeze(
             .repo_root
             .join("crates/harness-cli/Cargo.toml")
             .is_file();
+    // Short-circuit before canonicalize so non-upstream callers (the common
+    // case) skip two realpath syscalls per invocation. `is_upstream_source` is
+    // pure metadata work — it inspects two Cargo.toml files.
+    if !is_upstream_source {
+        return Ok(None);
+    }
+
     let default_db = context.repo_root.join("harness.db");
     // Resolve relative paths against the repo root so the freeze sentinel
     // cannot be bypassed by supplying `harness.db`, `./harness.db`, or any
-    // other string that refers to the same target database. Best-effort
-    // canonicalize closes the symlink bypass when the file already exists.
-    let resolved_db_path = if context.db_path.is_relative() {
-        context.repo_root.join(&context.db_path)
-    } else {
-        context.db_path.clone()
-    };
-    let canonical_resolved =
-        std::fs::canonicalize(&resolved_db_path).unwrap_or(resolved_db_path.clone());
+    // other string that refers to the same target database. `Path::join`
+    // replaces the receiver when its argument is absolute, so the same call
+    // covers both relative and absolute `db_path`. Best-effort canonicalize
+    // closes the symlink bypass when the file already exists.
+    let resolved_db_path = context.repo_root.join(&context.db_path);
+    let canonical_resolved = std::fs::canonicalize(&resolved_db_path).unwrap_or(resolved_db_path);
     let canonical_default = std::fs::canonicalize(&default_db).unwrap_or(default_db);
-    let targets_default_database = canonical_resolved == canonical_default;
-    if !is_upstream_source || !targets_default_database {
+    if canonical_resolved != canonical_default {
         return Ok(None);
     }
 
@@ -2449,24 +2452,17 @@ fn print_interventions(records: &[InterventionRecord]) {
 }
 
 fn json_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
+    // Delegated to serde_json so the control-character handling stays in sync
+    // with RFC 8259 — including the generic `\u00xx` fallback for bytes below
+    // 0x20 that the previous hand-rolled encoder had to spell out one by one.
+    // `to_string` wraps the escaped body in quotes; strip them so the call
+    // sites that print `\"field\": {}` keep working without rewriting every
+    // print site. Serializing a `&str` is infallible, so the unwrap is safe.
+    serde_json::to_string(value)
+        .expect("serializing a Rust &str to JSON is infallible")
+        .trim_start_matches('"')
+        .trim_end_matches('"')
+        .to_owned()
 }
 
 fn print_stats(stats: &HarnessStats) {

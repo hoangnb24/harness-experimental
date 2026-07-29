@@ -138,10 +138,7 @@ def verify_pair(payload: dict[str, Any], generation: str) -> None:
 def rename_and_record(
     payload: dict[str, Any], journal: Path, source: Path, destination: Path, step: str, inject: str | None
 ) -> None:
-    if destination.exists():
-        raise TransitionError(f"rename destination already exists: {destination}")
-    os.replace(source, destination)
-    fsync_dir(destination.parent)
+    _checked_replace(source, destination, "rename destination already exists")
     # Injection is deliberately before the journal update: this is the hardest
     # real crash boundary. Recovery must infer the completed rename from hashes.
     if inject == step:
@@ -149,6 +146,21 @@ def rename_and_record(
     payload["completed_steps"].append(step)
     payload["state"] = step
     write_journal(journal, payload)
+
+
+def _checked_replace(source: Path, destination: Path, error_label: str) -> None:
+    """Atomic rename with destination-exists guard and parent-dir fsync.
+
+    Shared between the forward path (`rename_and_record`) and the compensation
+    path (`compensate`) so both keep the same I/O shape and the same failure
+    mode when the destination already exists. The journal update and step
+    bookkeeping remain at the call site because the two paths label `state`
+    differently and the forward path also tracks `completed_steps`.
+    """
+    if destination.exists():
+        raise TransitionError(f"{error_label}: {destination}")
+    os.replace(source, destination)
+    fsync_dir(destination.parent)
 
 
 def reconcile_unjournaled_renames(payload: dict[str, Any], journal: Path) -> None:
@@ -221,10 +233,7 @@ def compensate(payload: dict[str, Any], journal: Path) -> None:
     for step, source, destination in compensations:
         if step not in completed:
             continue
-        if destination.exists():
-            raise TransitionError(f"compensation destination already exists: {destination}")
-        os.replace(source, destination)
-        fsync_dir(destination.parent)
+        _checked_replace(source, destination, "compensation destination already exists")
         payload["state"] = f"compensating:{step}"
         write_journal(journal, payload)
     verify_pair(payload, "legacy")

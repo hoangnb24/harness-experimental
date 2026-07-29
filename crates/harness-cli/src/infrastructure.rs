@@ -5291,24 +5291,22 @@ fn logical_database_sha256(connection: &Connection) -> Result<String> {
 fn rollback_changeset_append(append: &mut ChangesetAppend) -> Result<()> {
     // Prefer reusing the descriptor from the original append: it still holds
     // the exclusive lock, so `set_len` cannot race with another process
-    // concurrently writing to the same changeset file. `as_mut` is required
-    // because we seek the descriptor and seek needs a mutable reference; we
-    // shadow the binding to keep the rollback block readable.
-    if let Some(file) = append.file.as_mut() {
-        file.set_len(append.original_len)?;
-        file.seek(SeekFrom::Start(append.original_len))?;
-        file.sync_all()?;
-    } else {
-        // Defensive branch — see the struct invariant on `file`. Re-acquire the
-        // exclusive lock and hold it for the whole rollback window so a
-        // concurrent writer cannot clobber the truncation mid-operation, then
-        // flush before letting the descriptor drop.
-        let mut file = OpenOptions::new().write(true).open(&append.path)?;
+    // concurrently writing to the same changeset file. The `None` arm is
+    // defensive — see the struct invariant on `file` — and re-acquires the
+    // exclusive lock for the whole rollback window before truncating, so we
+    // cannot reintroduce a race if the field is ever unset.
+    if append.file.is_none() {
+        let file = OpenOptions::new().write(true).open(&append.path)?;
         file.lock_exclusive()?;
-        file.set_len(append.original_len)?;
-        file.seek(SeekFrom::Start(append.original_len))?;
-        file.sync_all()?;
+        append.file = Some(file);
     }
+    let file = append
+        .file
+        .as_mut()
+        .expect("file is initialized above or already present");
+    file.set_len(append.original_len)?;
+    file.seek(SeekFrom::Start(append.original_len))?;
+    file.sync_all()?;
     Ok(())
 }
 
