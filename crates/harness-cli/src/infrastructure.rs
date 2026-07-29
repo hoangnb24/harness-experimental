@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use fs2::FileExt;
 use rusqlite::{
     config::DbConfig,
     hooks::{AuthAction, AuthContext, Authorization},
@@ -262,6 +263,19 @@ pub struct SqliteHarnessRepository {
 struct ChangesetAppend {
     path: PathBuf,
     original_len: u64,
+    /// Held exclusively while the append is in flight and during rollback so a
+    /// concurrent CLI invocation cannot `set_len` our pending bytes (which
+    /// previously caused it to clobber a sibling process's committed
+    /// operations).
+    ///
+    /// Invariant: `file` is always `Some` in practice — `ChangesetAppend` is
+    /// only constructed in `append_changeset_operations` and that path always
+    /// populates this field with the locked descriptor it just opened. The
+    /// `None` arm exists only so `rollback_changeset_append` can recover a
+    /// best-effort truncation if the field is ever unset, but does not
+    /// reintroduce a race because in that branch the helper re-acquires the
+    /// exclusive lock and holds it for the whole rollback before dropping.
+    file: Option<std::fs::File>,
 }
 
 #[derive(Debug)]
@@ -753,14 +767,22 @@ impl SqliteHarnessRepository {
 
     fn apply_pending_migrations(
         &self,
-        connection: &Connection,
+        connection: &mut Connection,
         current_version: i64,
     ) -> Result<Vec<i64>> {
         let mut applied = Vec::new();
         for (version, path) in self.migration_files()? {
             if version > current_version {
                 let sql = fs::read_to_string(path)?;
-                connection.execute_batch(&sql)?;
+                // Wrap each migration in a single transaction so a crash
+                // mid-script cannot leave the schema half-applied (e.g.
+                // `schema_version` recorded but tables not yet created).
+                // Without this, `apply_schema_v1` could record `version = 1`
+                // before the CREATE TABLE statements run and brick the DB.
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(&sql)?;
+                transaction.commit()?;
                 applied.push(version);
             }
         }
@@ -795,6 +817,31 @@ impl SqliteHarnessRepository {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .and_then(|value| {
+                if Self::is_safe_run_id(&value) {
+                    Some(value)
+                } else {
+                    // Reject absolute paths, traversal segments, and any character
+                    // outside the safe set so HARNESS_RUN_ID cannot escape
+                    // `.harness/changesets` when joined into a path.
+                    None
+                }
+            })
+    }
+
+    /// Validates that a run id can safely be joined under `.harness/changesets`
+    /// without escaping it. Allows the character set used by both automatic
+    /// run ids (`run_auto_*`) and explicit ids supplied via the programmatic
+    /// test helper. Rejects absolute paths, `..` segments, separators, NULs,
+    /// and any other character outside `[A-Za-z0-9._-]`.
+    fn is_safe_run_id(run_id: &str) -> bool {
+        !run_id.is_empty()
+            && run_id.len() <= 128
+            && !run_id.starts_with('.')
+            && run_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+            && !run_id.contains("..")
     }
 
     fn is_source_tracked_state(repo_root: &Path, db_path: &Path) -> bool {
@@ -848,8 +895,8 @@ impl SqliteHarnessRepository {
         match transaction.commit() {
             Ok(()) => Ok(result),
             Err(error) => {
-                if let Some(append) = append {
-                    rollback_changeset_append(&append)?;
+                if let Some(mut append) = append {
+                    rollback_changeset_append(&mut append)?;
                 }
                 Err(error.into())
             }
@@ -874,6 +921,11 @@ impl SqliteHarnessRepository {
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Hold an exclusive advisory lock for the entire append+commit
+        // window so a concurrent CLI invocation cannot `set_len` the file
+        // (its own rollback path) and clobber bytes that another process
+        // has already committed.
+        file.lock_exclusive()?;
 
         if original_len == 0 {
             let header = json!({
@@ -890,8 +942,13 @@ impl SqliteHarnessRepository {
         }
         file.flush()?;
         file.sync_all()?;
-
-        Ok(Some(ChangesetAppend { path, original_len }))
+        // Keep the lock held; release only on success (ChangesetAppend is
+        // dropped) or explicit rollback (which reuses the same descriptor).
+        Ok(Some(ChangesetAppend {
+            path,
+            original_len,
+            file: Some(file),
+        }))
     }
 
     fn parse_changeset(&self, path: &Path) -> Result<ParsedChangeset> {
@@ -1170,8 +1227,9 @@ impl HarnessRepository for SqliteHarnessRepository {
             let connection = self.open_existing()?;
             let current = Self::schema_version(&connection).unwrap_or(0);
             if current == 0 {
+                let mut connection = connection;
                 self.apply_schema_v1(&connection)?;
-                self.apply_pending_migrations(&connection, 1)?;
+                self.apply_pending_migrations(&mut connection, 1)?;
                 return Ok(InitResult::MigratedExisting {
                     db_path: self.db_path.clone(),
                 });
@@ -1183,18 +1241,18 @@ impl HarnessRepository for SqliteHarnessRepository {
             });
         }
 
-        let connection = self.open_or_create()?;
+        let mut connection = self.open_or_create()?;
         self.apply_schema_v1(&connection)?;
-        self.apply_pending_migrations(&connection, 1)?;
+        self.apply_pending_migrations(&mut connection, 1)?;
         Ok(InitResult::Created {
             db_path: self.db_path.clone(),
         })
     }
 
     fn migrate(&self) -> Result<MigrateResult> {
-        let connection = self.open_existing()?;
+        let mut connection = self.open_existing()?;
         let current_version = Self::schema_version(&connection).unwrap_or(0);
-        let applied = self.apply_pending_migrations(&connection, current_version)?;
+        let applied = self.apply_pending_migrations(&mut connection, current_version)?;
 
         Ok(MigrateResult {
             current_version,
@@ -5230,8 +5288,22 @@ fn logical_database_sha256(connection: &Connection) -> Result<String> {
     Ok(sha256_bytes(&serde_json::to_vec(&canonical_tables)?))
 }
 
-fn rollback_changeset_append(append: &ChangesetAppend) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).open(&append.path)?;
+fn rollback_changeset_append(append: &mut ChangesetAppend) -> Result<()> {
+    // Prefer reusing the descriptor from the original append: it still holds
+    // the exclusive lock, so `set_len` cannot race with another process
+    // concurrently writing to the same changeset file. The `None` arm is
+    // defensive — see the struct invariant on `file` — and re-acquires the
+    // exclusive lock for the whole rollback window before truncating, so we
+    // cannot reintroduce a race if the field is ever unset.
+    if append.file.is_none() {
+        let file = OpenOptions::new().write(true).open(&append.path)?;
+        file.lock_exclusive()?;
+        append.file = Some(file);
+    }
+    let file = append
+        .file
+        .as_mut()
+        .expect("file is initialized above or already present");
     file.set_len(append.original_len)?;
     file.seek(SeekFrom::Start(append.original_len))?;
     file.sync_all()?;
@@ -10865,5 +10937,100 @@ implemented
             sha256_bytes(&fs::read(&result.output).unwrap()),
             result.snapshot_file_sha256
         );
+    }
+
+    #[test]
+    fn rollback_changeset_append_truncates_to_original_len() {
+        // Reproduces the rollback path that fires when a transaction commits
+        // fail after the changeset has been buffered but before it is durable.
+        // The helper must restore the file to exactly its `original_len` and
+        // leave the pre-existing bytes intact — otherwise a partially-rolled
+        // back changeset could leave half-written lines that the replay path
+        // later treats as committed operations.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("rollback.changeset.jsonl");
+        let pre_existing = "{\"op\":\"changeset.header\",\"version\":1,\"run_id\":\"run_prior\",\"base_schema_version\":13}\n";
+        fs::write(&path, pre_existing).unwrap();
+        let original_len = pre_existing.len() as u64;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.lock_exclusive().unwrap();
+        // Simulate the operations that would have been buffered before the
+        // commit failed. Bytes past `original_len` are what the rollback must
+        // discard.
+        let pending = "{\"op\":\"story.add\",\"version\":1,\"id\":\"US-ROLL\",\"payload\":{\"title\":\"Roll\",\"risk_lane\":\"normal\",\"contract_doc\":null,\"verify_command\":\"true\",\"notes\":null}}\n";
+        writeln!(file, "{}", pending).unwrap();
+        file.flush().unwrap();
+
+        let mut append = ChangesetAppend {
+            path: path.clone(),
+            original_len,
+            file: Some(file),
+        };
+
+        rollback_changeset_append(&mut append).unwrap();
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            after.len() as u64,
+            original_len,
+            "rollback must restore original length"
+        );
+        assert_eq!(
+            std::str::from_utf8(&after).unwrap(),
+            pre_existing,
+            "rollback must leave pre-existing bytes intact",
+        );
+        // The locked descriptor is still held so a concurrent writer cannot
+        // have raced between the truncation and the read above.
+        assert!(append.file.is_some());
+    }
+
+    #[test]
+    fn rollback_changeset_append_reacquires_lock_when_handle_missing() {
+        // The defensive `file: None` branch is unreachable from production
+        // code today (see the struct invariant) but exists so the helper can
+        // still truncate if a future call site constructs a ChangesetAppend
+        // without keeping the locked descriptor. This test pins that
+        // behaviour: even when the helper reopens the file, it must hold an
+        // exclusive lock for the entire rollback window and leave only the
+        // pre-existing bytes behind.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("rollback-no-handle.changeset.jsonl");
+        let pre_existing = "{\"op\":\"changeset.header\",\"version\":1,\"run_id\":\"run_prior\",\"base_schema_version\":13}\n";
+        fs::write(&path, pre_existing).unwrap();
+        let original_len = pre_existing.len() as u64;
+
+        // Drop the locked descriptor so the helper has to reopen.
+        let mut append = ChangesetAppend {
+            path: path.clone(),
+            original_len,
+            file: None,
+        };
+        // Stage bytes past the rollback boundary that the helper must
+        // discard.
+        let mut stage = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            stage,
+            "{}",
+            "{\"op\":\"story.add\",\"version\":1,\"id\":\"US-STAGE\",\"payload\":{\"title\":\"Stage\",\"risk_lane\":\"normal\",\"contract_doc\":null,\"verify_command\":\"true\",\"notes\":null}}"
+        )
+        .unwrap();
+        stage.flush().unwrap();
+        drop(stage);
+
+        rollback_changeset_append(&mut append).unwrap();
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(after.len() as u64, original_len);
+        assert_eq!(std::str::from_utf8(&after).unwrap(), pre_existing);
     }
 }

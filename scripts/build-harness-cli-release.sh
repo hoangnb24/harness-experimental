@@ -99,7 +99,11 @@ fi
 
 (
   cd "$repo_root"
-  cargo "${cargo_args[@]}"
+  # Always build release artifacts with --locked so the binary only links the
+  # exact dependency set that has been verified by repository CI. A release
+  # artifact that resolves a never-reviewed dependency version defeats the
+  # reproducibility promise the installer's SHA-256 check is meant to enforce.
+  cargo "${cargo_args[@]}" --locked
 )
 
 [ -f "$binary" ] || fail "Expected compiled binary missing: $binary"

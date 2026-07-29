@@ -43,7 +43,7 @@ impl ThreeWayMergePort for GitThreeWayMerge {
             .map_err(|error| PortError::new(format!("could not run git merge-file: {error}")))?;
         match output.status.code() {
             Some(0) => Ok(MergeOutcome::Clean(output.stdout)),
-            Some(1) => Ok(MergeOutcome::Conflict {
+            Some(code) if (1..=127).contains(&code) => Ok(MergeOutcome::Conflict {
                 content: output.stdout,
                 detail: "local and upstream changes overlap".to_owned(),
             }),
@@ -76,5 +76,30 @@ mod tests {
         assert!(matches!(clean, MergeOutcome::Clean(_)));
         let conflict = merger.merge(b"one\n", b"local\n", b"upstream\n").unwrap();
         assert!(matches!(conflict, MergeOutcome::Conflict { .. }));
+    }
+
+    #[test]
+    fn git_reports_conflicts_when_multiple_hunks_overlap() {
+        let merger = GitThreeWayMerge;
+        let base = b"one\ntwo\nthree\nfour\nfive\nsix\n";
+        let local = b"one\nLOCAL\nthree\nfour\nLOCAL-TWO\nsix\n";
+        let upstream = b"one\nUPSTREAM\nthree\nfour\nUPSTREAM-TWO\nsix\n";
+        let conflict = merger.merge(base, local, upstream).unwrap();
+        match conflict {
+            MergeOutcome::Conflict { content, detail } => {
+                assert!(
+                    content.windows(7).any(|window| window == b"<<<<<<<"),
+                    "expected at least one conflict marker in stdout, got: {}",
+                    String::from_utf8_lossy(&content)
+                );
+                assert!(
+                    content.windows(7).any(|window| window == b">>>>>>>"),
+                    "expected closing conflict markers, got: {}",
+                    String::from_utf8_lossy(&content)
+                );
+                assert!(detail.contains("overlap"));
+            }
+            other => panic!("expected Conflict, got {:?}", other),
+        }
     }
 }

@@ -311,11 +311,11 @@ complete compatibility bundle and download the prebuilt Rust executable into
 Windows after verifying its `.sha256` checksum.
 
 A source branch can pin the release used by the installer through
-`scripts/harness-cli-release-tag`; Phase 3 pins `harness-cli-v0.1.4` so branch
-installs receive a Phase 3-built CLI. Set `HARNESS_CLI_RELEASE_TAG` to override
-that tag, or set `HARNESS_CLI_BASE_URL` to point at an alternate artifact
-directory, such as a local `file:///.../dist` directory created by
-`scripts/build-harness-cli-release.sh`.
+`scripts/harness-cli-release-tag`; the tracked pin currently reads
+`harness-cli-v0.1.23` so branch installs receive the latest released CLI. Set
+`HARNESS_CLI_RELEASE_TAG` to override that tag, or set `HARNESS_CLI_BASE_URL` to
+point at an alternate artifact directory, such as a local `file:///.../dist`
+directory created by `scripts/build-harness-cli-release.sh`.
 
 `--merge` (PowerShell: `-Merge`) deliberately does not replace an existing CLI.
 An ordinary core merge or override does not touch the scripts tree at all.
